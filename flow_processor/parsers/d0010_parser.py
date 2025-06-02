@@ -1,4 +1,3 @@
-import csv
 import hashlib
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -9,25 +8,27 @@ logger = logging.getLogger(__name__)
 
 
 class D0010Parser:
-    """Parser for D0010 flow files"""
+    """Parser for D0010 UFF (Uniform File Format) flow files"""
     
-    # D0010 field positions (0-indexed)
-    FIELD_POSITIONS = {
-        'record_type': 0,
-        'mpan': 1,
-        'meter_serial': 2,
-        'reading_date': 3,
-        'reading_time': 4,
-        'register_id': 5,
-        'reading_value': 6,
-        'reading_type': 7,
+    # Record type identifiers
+    RECORD_TYPES = {
+        'ZHV': 'header',
+        '026': 'mpan',
+        '028': 'meter_serial',
+        '030': 'reading',
+        'ZPT': 'footer'
     }
     
-    # Valid reading types in D0010
+    # Reading type mappings from D0010 specification
     READING_TYPES = {
         'A': 'actual',
-        'E': 'estimated',
         'C': 'customer',
+        'D': 'deemed',
+        'E': 'estimated',
+        'F': 'final',
+        'I': 'initial',
+        'M': 'manual',
+        'S': 'subsequent',
     }
     
     def __init__(self):
@@ -44,27 +45,67 @@ class D0010Parser:
     
     def parse_file(self, filepath: str) -> Tuple[List[Dict], str]:
         """
-        Parse D0010 file and return list of reading records
+        Parse D0010 UFF file and return list of reading records
         Returns: (readings, file_hash)
         """
         readings = []
         file_hash = self.calculate_file_hash(filepath)
+        
+        current_mpan = None
+        current_meter_serial = None
         
         encodings = ['utf-8', 'latin-1', 'cp1252']
         
         for encoding in encodings:
             try:
                 with open(filepath, 'r', encoding=encoding) as file:
-                    reader = csv.reader(file, delimiter='|')
+                    line_num = 0
                     
-                    for line_num, row in enumerate(reader, 1):
-                        try:
-                            reading = self._parse_row(row, line_num)
-                            if reading:
-                                readings.append(reading)
-                        except Exception as e:
-                            self.errors.append(f"Line {line_num}: {str(e)}")
-                            logger.error(f"Error parsing line {line_num}: {e}")
+                    for line in file:
+                        line_num += 1
+                        line = line.strip()
+                        
+                        if not line:
+                            continue
+                        
+                        # Split by pipe delimiter
+                        fields = line.split('|')
+                        
+                        if not fields:
+                            continue
+                        
+                        record_type = fields[0]
+                        
+                        if record_type == 'ZHV':
+                            # Header record - validate file type
+                            if len(fields) > 2 and not fields[2].startswith('D0010'):
+                                self.errors.append(f"Line {line_num}: Not a D0010 file (found {fields[2]})")
+                                return [], file_hash
+                                
+                        elif record_type == '026':
+                            # MPAN record
+                            current_mpan = self._parse_mpan_record(fields, line_num)
+                            
+                        elif record_type == '028':
+                            # Meter serial number record
+                            current_meter_serial = self._parse_meter_record(fields, line_num)
+                            
+                        elif record_type == '030':
+                            # Reading record
+                            if current_mpan and current_meter_serial:
+                                reading = self._parse_reading_record(
+                                    fields, current_mpan, current_meter_serial, line_num
+                                )
+                                if reading:
+                                    readings.append(reading)
+                            else:
+                                self.warnings.append(
+                                    f"Line {line_num}: Reading record without MPAN/meter"
+                                )
+                                
+                        elif record_type == 'ZPT':
+                            # Footer record - end of file
+                            break
                     
                     break  # Successfully read file
                     
@@ -76,62 +117,81 @@ class D0010Parser:
         logger.info(f"Parsed {len(readings)} valid readings from {filepath}")
         return readings, file_hash
     
-    def _parse_row(self, row: List[str], line_num: int) -> Optional[Dict]:
-        """Parse a single row from D0010 file"""
-        # Skip empty rows
-        if not row or all(field.strip() == '' for field in row):
+    def _parse_mpan_record(self, fields: List[str], line_num: int) -> Optional[str]:
+        """Parse MPAN from 026 record"""
+        if len(fields) < 2:
+            self.warnings.append(f"Line {line_num}: Invalid MPAN record")
             return None
         
-        # Check minimum field count
-        if len(row) < 8:
-            self.warnings.append(f"Line {line_num}: Insufficient fields (expected 8, got {len(row)})")
+        mpan = fields[1].strip()
+        return self._validate_mpan(mpan, line_num)
+    
+    def _parse_meter_record(self, fields: List[str], line_num: int) -> Optional[str]:
+        """Parse meter serial number from 028 record"""
+        if len(fields) < 2:
+            self.warnings.append(f"Line {line_num}: Invalid meter record")
+            return None
+        
+        serial = fields[1].strip()
+        return self._validate_serial(serial, line_num)
+    
+    def _parse_reading_record(
+        self, 
+        fields: List[str], 
+        mpan: str, 
+        meter_serial: str, 
+        line_num: int
+    ) -> Optional[Dict]:
+        """Parse reading data from 030 record"""
+        # Expected format: 030|register_id|reading_datetime|reading_value|...
+        if len(fields) < 4:
+            self.warnings.append(f"Line {line_num}: Invalid reading record")
             return None
         
         try:
-            # Extract and validate fields
-            mpan = self._validate_mpan(row[self.FIELD_POSITIONS['mpan']], line_num)
-            if not mpan:
+            register_id = fields[1].strip() or '01'
+            
+            # Parse datetime
+            datetime_str = fields[2].strip()
+            reading_datetime = self._parse_datetime(datetime_str, line_num)
+            if not reading_datetime:
                 return None
             
-            meter_serial = self._validate_serial(row[self.FIELD_POSITIONS['meter_serial']], line_num)
-            if not meter_serial:
-                return None
-            
-            reading_date = self._parse_date(row[self.FIELD_POSITIONS['reading_date']], line_num)
-            if not reading_date:
-                return None
-            
-            reading_time = self._parse_time(row[self.FIELD_POSITIONS['reading_time']], line_num)
-            
-            register_id = row[self.FIELD_POSITIONS['register_id']].strip() or '01'
-            
-            reading_value = self._parse_decimal(row[self.FIELD_POSITIONS['reading_value']], line_num)
+            # Parse reading value
+            value_str = fields[3].strip()
+            reading_value = self._parse_decimal(value_str, line_num)
             if reading_value is None:
                 return None
             
-            reading_type_code = row[self.FIELD_POSITIONS['reading_type']].strip().upper()
-            reading_type = self.READING_TYPES.get(reading_type_code, 'actual')
+            # Determine reading type (might be in later fields or default)
+            reading_type = 'actual'  # Default
+            if len(fields) > 7:
+                type_indicator = fields[7].strip()
+                if type_indicator in self.READING_TYPES:
+                    reading_type = self.READING_TYPES[type_indicator]
             
             return {
                 'mpan': mpan,
                 'meter_serial': meter_serial,
-                'reading_date': reading_date,
-                'reading_time': reading_time,
+                'reading_date': reading_datetime.date(),
+                'reading_time': reading_datetime.time(),
                 'register_id': register_id,
                 'reading_value': reading_value,
                 'reading_type': reading_type,
             }
             
-        except IndexError as e:
-            self.errors.append(f"Line {line_num}: Field access error - {e}")
+        except Exception as e:
+            self.errors.append(f"Line {line_num}: Error parsing reading - {e}")
             return None
     
     def _validate_mpan(self, mpan: str, line_num: int) -> Optional[str]:
         """Validate MPAN format (13 digits)"""
-        mpan = mpan.strip()
         if not mpan:
             self.warnings.append(f"Line {line_num}: Empty MPAN")
             return None
+        
+        # Remove any spaces
+        mpan = mpan.replace(' ', '')
         
         if not mpan.isdigit() or len(mpan) != 13:
             self.warnings.append(f"Line {line_num}: Invalid MPAN format '{mpan}' (expected 13 digits)")
@@ -141,7 +201,6 @@ class D0010Parser:
     
     def _validate_serial(self, serial: str, line_num: int) -> Optional[str]:
         """Validate meter serial number"""
-        serial = serial.strip()
         if not serial:
             self.warnings.append(f"Line {line_num}: Empty meter serial number")
             return None
@@ -152,36 +211,33 @@ class D0010Parser:
         
         return serial
     
-    def _parse_date(self, date_str: str, line_num: int) -> Optional[datetime.date]:
-        """Parse date in YYYYMMDD format"""
-        date_str = date_str.strip()
-        if not date_str:
-            self.warnings.append(f"Line {line_num}: Empty date")
+    def _parse_datetime(self, datetime_str: str, line_num: int) -> Optional[datetime]:
+        """Parse datetime in YYYYMMDDHHmmss format"""
+        if not datetime_str:
+            self.warnings.append(f"Line {line_num}: Empty datetime")
             return None
         
         try:
-            # D0010 uses YYYYMMDD format
-            return datetime.strptime(date_str, '%Y%m%d').date()
+            # D0010 uses YYYYMMDDHHmmss format
+            # Handle cases where time might be 000000
+            if len(datetime_str) == 14:
+                return datetime.strptime(datetime_str, '%Y%m%d%H%M%S')
+            elif len(datetime_str) == 8:
+                # Date only
+                return datetime.strptime(datetime_str, '%Y%m%d')
+            else:
+                self.warnings.append(
+                    f"Line {line_num}: Invalid datetime format '{datetime_str}'"
+                )
+                return None
         except ValueError:
-            self.warnings.append(f"Line {line_num}: Invalid date format '{date_str}' (expected YYYYMMDD)")
-            return None
-    
-    def _parse_time(self, time_str: str, line_num: int) -> Optional[datetime.time]:
-        """Parse time in HHMM format"""
-        time_str = time_str.strip()
-        if not time_str:
-            return None
-        
-        try:
-            # D0010 uses HHMM format
-            return datetime.strptime(time_str, '%H%M').time()
-        except ValueError:
-            self.warnings.append(f"Line {line_num}: Invalid time format '{time_str}' (expected HHMM)")
+            self.warnings.append(
+                f"Line {line_num}: Invalid datetime format '{datetime_str}'"
+            )
             return None
     
     def _parse_decimal(self, value_str: str, line_num: int) -> Optional[Decimal]:
         """Parse decimal reading value"""
-        value_str = value_str.strip()
         if not value_str:
             self.warnings.append(f"Line {line_num}: Empty reading value")
             return None
